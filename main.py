@@ -55,6 +55,16 @@ class ServerManager:
         
         return valid_servers
 
+    async def get_available_servers(self, validate_first: bool = False) -> list:
+        if validate_first:
+            if Prompt.ask(
+                "\n[yellow]Would you like to validate servers?[/yellow]",
+                choices=["y", "n"],
+                default="n"
+            ) == "y":
+                return await self.validate_all_servers()
+        return self.servers
+
 class LLMClient:
     def __init__(self):
         self.base_url = ""
@@ -132,30 +142,33 @@ async def main():
     server_manager = ServerManager()
     client = LLMClient()
     
+    # Initial server selection with optional validation
+    valid_servers = await server_manager.get_available_servers(validate_first=True)
+    if not await client.select_server(valid_servers):
+        return
+            
     while True:
-        valid_servers = await server_manager.validate_all_servers()
-        if not await client.select_server(valid_servers):
-            continue
-            
+        models = await client.get_models()
+        if not await client.select_model(models):
+            break
+        
         while True:
-            models = await client.get_models()
-            if not await client.select_model(models):
-                break
-            
-            while True:
-                try:
-                    prompt = Prompt.ask("\n[cyan]Enter prompt[/cyan] ([yellow]'b'[/yellow] to change model, [yellow]'s'[/yellow] to change server)")
-                    if prompt.lower() == 'b':
-                        break
-                    if prompt.lower() == 's':
-                        break
-                    await client.generate(prompt)
-                except KeyboardInterrupt:
-                    rprint("\n[yellow]Exiting...[/yellow]")
-                    return
-            
-            if prompt.lower() == 's':
-                break
+            try:
+                prompt = Prompt.ask("\n[cyan]Enter prompt[/cyan] ([yellow]'b'[/yellow] to change model, [yellow]'s'[/yellow] to change server)")
+                if prompt.lower() == 'b':
+                    break
+                if prompt.lower() == 's':
+                    # Direct server selection without validation
+                    if not await client.select_server(server_manager.servers):
+                        continue
+                    break
+                await client.generate(prompt)
+            except KeyboardInterrupt:
+                rprint("\n[yellow]Exiting...[/yellow]")
+                return
+        
+        if prompt.lower() == 's':
+            continue
 
 if __name__ == "__main__":
     try:
