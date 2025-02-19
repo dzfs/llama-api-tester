@@ -14,6 +14,7 @@ SERVER_LIST_FILE = "srv_list.txt"
 class ServerManager:
     def __init__(self):
         self.servers = self.load_servers()
+        self.valid_servers = self.servers.copy()  # Initially all servers are considered valid
 
     def load_servers(self) -> list:
         if not Path(SERVER_LIST_FILE).exists():
@@ -35,25 +36,25 @@ class ServerManager:
             return False
 
     async def validate_all_servers(self) -> list:
-        valid_servers = []
+        self.valid_servers = []
         invalid_servers = []
         
         for server in self.servers:
             rprint(f"[yellow]Validating {server}...[/yellow]")
             if await self.validate_server(server):
-                valid_servers.append(server)
+                self.valid_servers.append(server)
                 rprint(f"[green]✓ {server} is valid[/green]")
             else:
                 invalid_servers.append(server)
                 rprint(f"[red]✗ {server} is invalid[/red]")
         
         if invalid_servers:
-            if Prompt.ask("[red]Remove invalid servers?[/red]", choices=["y", "n"]) == "y":
-                self.servers = valid_servers
+            if Prompt.ask("[red]Remove invalid servers from file?[/red]", choices=["y", "n"]) == "y":
+                self.servers = self.valid_servers
                 self.save_servers()
-                rprint("[green]Invalid servers removed[/green]")
+                rprint("[green]Invalid servers removed from file[/green]")
         
-        return valid_servers
+        return self.valid_servers
 
     async def get_available_servers(self, validate_first: bool = False) -> list:
         if validate_first:
@@ -62,8 +63,10 @@ class ServerManager:
                 choices=["y", "n"],
                 default="n"
             ) == "y":
-                return await self.validate_all_servers()
-        return self.servers
+                await self.validate_all_servers()
+            else:
+                self.valid_servers = self.servers.copy()
+        return self.valid_servers
 
 class LLMClient:
     def __init__(self):
@@ -98,21 +101,26 @@ class LLMClient:
                     console.print("[red]Failed to fetch models[/red]")
                     return []
 
-    async def select_model(self, models: list) -> None:
+    async def select_model(self, models: list) -> tuple[bool, str]:
         if not models:
             rprint("[red]No models available[/red]")
-            return False
+            return False, "retry"
 
         rprint("\n[cyan]Available models:[/cyan]")
         for idx, model in enumerate(models, 1):
             rprint(f"[blue]{idx}[/blue]. {model['id']}")
+        rprint("[yellow]Enter 's' to change server[/yellow]")
             
         choice = Prompt.ask(
-            "[cyan]Select model number[/cyan]",
-            choices=[str(i) for i in range(1, len(models) + 1)]
+            "[cyan]Select model number or action[/cyan]",
+            choices=[str(i) for i in range(1, len(models) + 1)] + ["s"]
         )
+        
+        if choice == "s":
+            return False, "server"
+            
         self.selected_model = models[int(choice)-1]['id']
-        return True
+        return True, ""
 
     async def generate(self, prompt: str) -> None:
         if not self.selected_model:
@@ -142,33 +150,33 @@ async def main():
     server_manager = ServerManager()
     client = LLMClient()
     
-    # Initial server selection with optional validation
     valid_servers = await server_manager.get_available_servers(validate_first=True)
-    if not await client.select_server(valid_servers):
-        return
-            
+    
     while True:
-        models = await client.get_models()
-        if not await client.select_model(models):
-            break
-        
+        if not await client.select_server(server_manager.valid_servers):
+            return
+            
         while True:
-            try:
-                prompt = Prompt.ask("\n[cyan]Enter prompt[/cyan] ([yellow]'b'[/yellow] to change model, [yellow]'s'[/yellow] to change server)")
-                if prompt.lower() == 'b':
-                    break
-                if prompt.lower() == 's':
-                    # Direct server selection without validation
-                    if not await client.select_server(server_manager.servers):
-                        continue
-                    break
-                await client.generate(prompt)
-            except KeyboardInterrupt:
-                rprint("\n[yellow]Exiting...[/yellow]")
-                return
-        
-        if prompt.lower() == 's':
-            continue
+            models = await client.get_models()
+            success, action = await client.select_model(models)
+            
+            if not success:
+                if action == "server":
+                    break  # Go back to server selection
+                continue  # Retry model selection
+            
+            while True:
+                try:
+                    prompt = Prompt.ask("\n[cyan]Enter prompt[/cyan] ([yellow]'b'[/yellow] to change model, [yellow]'s'[/yellow] to change server)")
+                    if prompt.lower() in ['b', 's']:
+                        break
+                    await client.generate(prompt)
+                except KeyboardInterrupt:
+                    rprint("\n[yellow]Exiting...[/yellow]")
+                    return
+            
+            if prompt.lower() == 's':
+                break
 
 if __name__ == "__main__":
     try:
