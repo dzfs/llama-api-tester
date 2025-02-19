@@ -7,14 +7,54 @@ from rich.prompt import Prompt
 from rich import print as rprint
 from pathlib import Path
 import os
+import csv
+from datetime import datetime, timedelta
+import shutil
 
 console = Console()
 SERVER_LIST_FILE = "srv_list.txt"
+CACHE_DIR = Path("cache")
+VALIDATION_CACHE_FILE = CACHE_DIR / "server_status.csv"
+SERVER_METADATA_FILE = CACHE_DIR / "server_metadata.json"
+CACHE_VALIDITY_MINUTES = 30
+
+class ServerMetadata:
+    def __init__(self):
+        self.data = self._load_metadata()
+    
+    def _load_metadata(self) -> dict:
+        if SERVER_METADATA_FILE.exists():
+            return json.loads(SERVER_METADATA_FILE.read_text())
+        return {}
+    
+    def save(self):
+        SERVER_METADATA_FILE.write_text(json.dumps(self.data, indent=2))
+    
+    def get_note(self, server: str) -> str:
+        return self.data.get(server, {}).get('note', '')
+    
+    def set_note(self, server: str, note: str):
+        if server not in self.data:
+            self.data[server] = {}
+        self.data[server]['note'] = note
+        self.save()
+    
+    def cache_models(self, server: str, models: list):
+        if server not in self.data:
+            self.data[server] = {}
+        self.data[server]['models'] = models
+        self.data[server]['models_cached_at'] = datetime.now().isoformat()
+        self.save()
+    
+    def get_cached_models(self, server: str) -> list:
+        return self.data.get(server, {}).get('models', [])
 
 class ServerManager:
     def __init__(self):
+        CACHE_DIR.mkdir(exist_ok=True)
         self.servers = self.load_servers()
-        self.valid_servers = self.servers.copy()  # Initially all servers are considered valid
+        self.valid_servers = self.servers.copy()
+        self.metadata = ServerMetadata()
 
     def load_servers(self) -> list:
         if not Path(SERVER_LIST_FILE).exists():
@@ -24,6 +64,31 @@ class ServerManager:
     def save_servers(self):
         with open(SERVER_LIST_FILE, "w") as f:
             f.write("\n".join(self.servers))
+
+    def _load_validation_cache(self) -> dict:
+        if not VALIDATION_CACHE_FILE.exists():
+            return {}
+        
+        cache = {}
+        with open(VALIDATION_CACHE_FILE, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                cache[row['server']] = {
+                    'valid': row['valid'] == 'True',
+                    'timestamp': datetime.fromisoformat(row['timestamp'])
+                }
+        return cache
+
+    def _save_validation_cache(self, cache: dict):
+        with open(VALIDATION_CACHE_FILE, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['server', 'valid', 'timestamp'])
+            writer.writeheader()
+            for server, data in cache.items():
+                writer.writerow({
+                    'server': server,
+                    'valid': data['valid'],
+                    'timestamp': data['timestamp'].isoformat()
+                })
 
     async def validate_server(self, server: str) -> bool:
         if not server.startswith(("http://", "https://")):
@@ -36,17 +101,41 @@ class ServerManager:
             return False
 
     async def validate_all_servers(self) -> list:
+        cache = self._load_validation_cache()
+        current_time = datetime.now()
         self.valid_servers = []
         invalid_servers = []
         
         for server in self.servers:
+            cached = cache.get(server)
+            if cached and (current_time - cached['timestamp']) < timedelta(minutes=CACHE_VALIDITY_MINUTES):
+                if cached['valid']:
+                    self.valid_servers.append(server)
+                    note = self.metadata.get_note(server)
+                    note_text = f" ({note})" if note else ""
+                    rprint(f"[blue]✓ {server}{note_text} (cached)[/blue]")
+                else:
+                    invalid_servers.append(server)
+                    rprint(f"[red]✗ {server} (cached)[/red]")
+                continue
+
             rprint(f"[yellow]Validating {server}...[/yellow]")
-            if await self.validate_server(server):
+            is_valid = await self.validate_server(server)
+            cache[server] = {
+                'valid': is_valid,
+                'timestamp': current_time
+            }
+            
+            if is_valid:
                 self.valid_servers.append(server)
-                rprint(f"[green]✓ {server} is valid[/green]")
+                note = self.metadata.get_note(server)
+                note_text = f" ({note})" if note else ""
+                rprint(f"[green]✓ {server}{note_text}[/green]")
             else:
                 invalid_servers.append(server)
-                rprint(f"[red]✗ {server} is invalid[/red]")
+                rprint(f"[red]✗ {server}[/red]")
+
+        self._save_validation_cache(cache)
         
         if invalid_servers:
             if Prompt.ask("[red]Remove invalid servers from file?[/red]", choices=["y", "n"]) == "y":
@@ -65,14 +154,21 @@ class ServerManager:
             ) == "y":
                 await self.validate_all_servers()
             else:
-                self.valid_servers = self.servers.copy()
+                cache = self._load_validation_cache()
+                current_time = datetime.now()
+                self.valid_servers = [
+                    server for server in self.servers
+                    if cache.get(server, {}).get('valid', True) and
+                    (current_time - cache.get(server, {}).get('timestamp', current_time)) < timedelta(minutes=CACHE_VALIDITY_MINUTES)
+                ]
         return self.valid_servers
 
 class LLMClient:
-    def __init__(self):
+    def __init__(self, metadata: ServerMetadata):
         self.base_url = ""
         self.selected_model = None
-        
+        self.metadata = metadata
+
     async def select_server(self, servers: list) -> bool:
         if not servers:
             rprint("[red]No valid servers available[/red]")
@@ -80,23 +176,43 @@ class LLMClient:
 
         rprint("\n[cyan]Available servers:[/cyan]")
         for idx, server in enumerate(servers, 1):
-            rprint(f"[blue]{idx}[/blue]. {server}")
+            note = self.metadata.get_note(server)
+            note_text = f" ({note})" if note else ""
+            rprint(f"[blue]{idx}[/blue]. {server}{note_text}")
             
-        choice = Prompt.ask(
-            "[cyan]Select server number[/cyan]",
-            choices=[str(i) for i in range(1, len(servers) + 1)]
-        )
-        self.base_url = servers[int(choice)-1]
-        if not self.base_url.startswith(("http://", "https://")):
-            self.base_url = f"http://{self.base_url}"
-        return True
+        rprint("[yellow]Enter 'n' followed by server number to add/edit note (e.g., 'n1')[/yellow]")
+        
+        while True:
+            choice = Prompt.ask(
+                "[cyan]Select server number or action[/cyan]",
+                choices=[str(i) for i in range(1, len(servers) + 1)] + [f"n{i}" for i in range(1, len(servers) + 1)]
+            )
+            
+            if choice.startswith('n'):
+                server_idx = int(choice[1:]) - 1
+                note = Prompt.ask(f"Enter note for {servers[server_idx]}")
+                self.metadata.set_note(servers[server_idx], note)
+                continue
+                
+            self.base_url = servers[int(choice)-1]
+            if not self.base_url.startswith(("http://", "https://")):
+                self.base_url = f"http://{self.base_url}"
+            return True
 
     async def get_models(self) -> list:
+        # Try to get cached models first
+        cached_models = self.metadata.get_cached_models(self.base_url)
+        if cached_models:
+            return cached_models
+
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{self.base_url}/v1/models") as response:
                 if response.status == 200:
                     data = await response.json()
-                    return data.get("data", [])
+                    models = data.get("data", [])
+                    # Cache the models
+                    self.metadata.cache_models(self.base_url, models)
+                    return models
                 else:
                     console.print("[red]Failed to fetch models[/red]")
                     return []
@@ -148,7 +264,7 @@ class LLMClient:
 
 async def main():
     server_manager = ServerManager()
-    client = LLMClient()
+    client = LLMClient(server_manager.metadata)
     
     valid_servers = await server_manager.get_available_servers(validate_first=True)
     
